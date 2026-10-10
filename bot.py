@@ -169,8 +169,11 @@ async def ask_mistral(prompt: str) -> tuple[str, str]:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "temperature": 0.7,
+        # raisonnement explicite (docs.mistral.ai/studio/conversations/reasoning) :
+        # "high" = chunk de raisonnement complet avant la réponse finale.
+        "reasoning_effort": "high",
     }
     headers: dict[str, str] = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
