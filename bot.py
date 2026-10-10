@@ -126,8 +126,43 @@ def build_transcript(
 
 # --- Appel API Mistral ---
 
-async def ask_mistral(prompt: str) -> str:
-    """Appelle l'API Mistral et retourne la réponse, ou lève une exception."""
+def parse_response_content(content: Any) -> tuple[str, str]:
+    """Sépare le contenu d'une réponse Mistral en (texte_final, raisonnement).
+
+    `content` peut être une simple chaîne, ou une liste de blocs typés
+    (ex. [{'type': 'thinking', ...}, {'type': 'text', ...}] pour les modèles
+    avec raisonnement). Les types inconnus sont ignorés.
+    """
+    if isinstance(content, str):
+        return content, ""
+    if not isinstance(content, list):
+        return str(content), ""
+
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text_parts.append(str(block.get("text", "")))
+        elif block_type == "thinking":
+            inner: Any = block.get("thinking", [])
+            if isinstance(inner, str):
+                thinking_parts.append(inner)
+            elif isinstance(inner, list):
+                thinking_parts.append(
+                    "".join(
+                        str(chunk.get("text", ""))
+                        for chunk in inner
+                        if isinstance(chunk, dict)
+                    )
+                )
+    return "\n".join(text_parts).strip(), "\n".join(thinking_parts).strip()
+
+
+async def ask_mistral(prompt: str) -> tuple[str, str]:
+    """Appelle l'API Mistral et retourne (réponse, raisonnement), ou lève une exception."""
     payload: dict[str, Any] = {
         "model": MISTRAL_MODEL,
         "messages": [
@@ -147,16 +182,19 @@ async def ask_mistral(prompt: str) -> str:
         )
         response.raise_for_status()
         data: dict[str, Any] = response.json()
-    return str(data["choices"][0]["message"]["content"])
+    return parse_response_content(data["choices"][0]["message"]["content"])
 
 
 # --- Construction du prompt ---
 
-async def generate_answer(message: discord.Message, invocation: str) -> tuple[str, bool]:
+async def generate_answer(
+    message: discord.Message, invocation: str
+) -> tuple[str, str, bool]:
     """Prépare le prompt (fenêtre glissante ou salon sans historique) puis appelle l'API.
 
-    Retourne (réponse, contexte_envoyé) : contexte_envoyé vaut True si les
-    derniers messages du salon ont bien été transmis à l'API comme contexte.
+    Retourne (réponse, raisonnement, contexte_envoyé) : contexte_envoyé vaut
+    True si les derniers messages du salon ont bien été transmis à l'API comme
+    contexte.
     """
     if message.channel.id in NO_HISTORY_CHANNEL_IDS:
         # Salon « sans historique » : seul le message d'invocation part vers l'API.
@@ -190,11 +228,44 @@ async def generate_answer(message: discord.Message, invocation: str) -> tuple[st
             f"Réponds au dernier message, adressé par « {invoker_pseudo} »."
         )
 
-    answer: str = await ask_mistral(prompt)
-    return answer, context_sent
+    answer: str
+    thinking: str
+    answer, thinking = await ask_mistral(prompt)
+    return answer, thinking, context_sent
 
 
 # --- Événements Discord ---
+
+class ThinkingView(discord.ui.View):
+    """Bouton qui affiche le raisonnement du modèle dans un message éphémère.
+
+    Le message éphémère n'est visible que par l'utilisateur qui a cliqué :
+    la trace de réflexion n'encombre pas le salon. Les boutons cessent de
+    fonctionner après un redémarrage du bot (l'état n'est pas persisté).
+    """
+
+    MAX_EPHEMERAL_MESSAGES: int = 3  # limite Discord par interaction
+
+    def __init__(self, thinking: str) -> None:
+        super().__init__(timeout=None)
+        self.thinking: str = thinking
+
+    @discord.ui.button(
+        label="Raisonnement", emoji="🤔", style=discord.ButtonStyle.secondary
+    )
+    async def show_thinking(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        header: str = "🤔 Raisonnement interne :\n\n"
+        chunks: list[str] = [
+            self.thinking[i : i + MAX_RESPONSE_CHARS]
+            for i in range(0, len(self.thinking), MAX_RESPONSE_CHARS)
+        ][: self.MAX_EPHEMERAL_MESSAGES]
+        chunks[0] = f"{header}{chunks[0]}"
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
+
 
 @client.event
 async def on_ready() -> None:
@@ -222,8 +293,9 @@ async def on_message(message: discord.Message) -> None:
     async with message.channel.typing():
         try:
             answer: str
+            thinking: str
             context_sent: bool
-            answer, context_sent = await generate_answer(message, invocation)
+            answer, thinking, context_sent = await generate_answer(message, invocation)
         except httpx.HTTPStatusError as exc:
             logger.error("Erreur API Mistral (HTTP %s)", exc.response.status_code)
             await message.reply(
@@ -241,9 +313,16 @@ async def on_message(message: discord.Message) -> None:
     emoji: str = CONTEXT_EMOJI if context_sent else NO_CONTEXT_EMOJI
     full_answer: str = f"{emoji} {answer}"
 
+    # bouton « raisonnement » : le clic l'affiche en message éphémère, visible
+    # uniquement par celui qui clique (ne prend pas de place dans le salon)
+    view: ThinkingView | None = ThinkingView(thinking) if thinking else None
+
     # découpe la réponse si elle dépasse la limite Discord
     for i in range(0, len(full_answer), MAX_RESPONSE_CHARS):
-        await message.reply(full_answer[i : i + MAX_RESPONSE_CHARS])
+        await message.reply(
+            full_answer[i : i + MAX_RESPONSE_CHARS],
+            view=view if i == 0 else None,
+        )
 
 
 def main() -> None:
